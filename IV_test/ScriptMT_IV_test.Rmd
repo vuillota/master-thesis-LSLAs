@@ -1,0 +1,576 @@
+---
+title: "Prediciting LSLA with world price index"
+author: "Antoine Vuillot"
+date: "2023-07-30"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+# Purpose of the script
+
+In this script, I compute a price index for agricultural lands targeted
+by a large-scale land acquisition. The price of a given land is computed
+as the average world price of potential agricultural production,
+weighted by the crop suitability of the differents crops. This index is
+inspired from Berman et al. 2023. World prices data on the period
+2000-2021 comes from World Bank data, and crop suitability is from GAEZ
+data. Information on land deals come from the Land Matrix Database
+(downloaded the 23-09-2023).
+
+Overall this index is a proxy for the profitability of a given
+agricultural land. I expect that the higher the index, the more likely
+it is for the land to be targeted by a LSLA. Should this relationship be
+statistically significant, it should be possible to use price index as
+an IV to predict deforestation in the land acquired.
+
+## Loading packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(tidyverse)
+library(haven)
+library(data.table)
+library(readxl)
+library(sf)
+library(RColorBrewer)
+library(dplyr)
+library(terra)
+library(tidyterra)
+library(gridExtra)
+library(grid)
+library(cowplot)
+library(scales)
+library(mapview)
+library(janitor)
+library(RCurl) #to download data from URLs
+
+#For TWFE
+library(estimatr)
+library(lfe)
+library(fastDummies)
+library(stargazer)
+```
+
+## Importing data
+
+```{r}
+
+#Berman et al. 2023
+rep_dta = read_dta('berman_al_2023/Replication_data.dta') 
+list_price_crop = read_dta('berman_al_2023/list_price_crop.dta') 
+wb_prices_annual_berman = read_dta('berman_al_2023/wb_prices_annual.dta') 
+suit_crop_gid_gaez = read_dta('berman_al_2023/suit_crop_gid_gaez.dta')
+list_crop_main = c("banana", "barley", "cocoa", "coconut", "coffee", "cotton", "maize", "oil palm", "dryland rice", "wetland rice", "sorghum", "soybean", "sugarcane", "tea", "tobacco", "wheat") #List of crops used in the main analysis of Berman et al. 2023
+
+#Annual commodity world prices (nominal)
+#https://www.worldbank.org/en/research/commodity-markets
+wb_prices_annual_all = read_excel("wb_cmo/CMO-Historical-Data-Annual.xlsx",
+                              sheet = "Annual Prices (Nominal)", 
+                              skip = 5) %>%
+  #Remove the two first lines (description of the variables)
+  slice(3:65) %>%
+  #Rename variables
+  rename("year" = "...1") %>%
+  clean_names() %>%
+  #Deal with "...", ".." values and transform to numeric all variables
+  mutate(across(.cols = everything(),
+                .fns = ~ case_when(.x %in% c("…", "..") ~ NA,
+                                   TRUE ~ .x))) %>%
+  mutate(across(.cols = everything(),
+                .fns = ~ as.numeric(.x)))
+
+
+#Data on land deals (all land deals reported by the LMD after filtering à la Muller et al. 2021)
+## Attributes
+lmd_muller = fread("data_muller_092023.csv") %>%
+  #Filter some deals :
+  ## year of intention and year of implementation after 2000
+  ## if year of implementation is unknown or deal never implemented, put to NA (null used to be for "never", "" for unknown)
+  mutate(year_int = as.numeric(year_int),
+         year_impl = as.numeric(
+           case_when(year_impl %in% c("", "null") ~ NA,
+                               TRUE ~ year_impl)),
+         year_cont = as.numeric(
+           case_when(year_cont %in% c("", "null") ~ NA,
+                               TRUE ~ year_cont))) %>%
+  filter(year_int >= 2000 & (is.na(year_impl) | year_impl >= 2000))
+
+##Land polygons
+## Note land polygons are defined as disk centered on deal location, whose area equals deals reported area in the LMD. This is necessary as most deals have no polygon reported (Müller et al. 2021).
+lmd_T_muller = st_read("Tbuf_muller_092023.geojson") %>%
+  filter(loc_id %in% lmd_muller$loc_id) %>%
+  mutate(ID = row_number()) 
+
+##An extent of land deals to restrict the computation areas of global rasters
+ext_muller = ext(lmd_T_muller)
+
+#mapview(lmd_T_muller)
+```
+
+## Download GAEZ data
+
+### List of files' URLs
+
+```{r}
+
+#List of files URLs from the GAEZ website
+# Suitability index on the 1981-2010 period, for rainfed water supply (all phases and not all phases), for the same crops as in Berman et al. 2023.
+# Both rainfed and rainfed all phases are downloaded to check whether there is any difference in the results obtained.
+list_files_si_all_land_1981_2010_gaez = fread('gaez/list_files_gaez_th4_si_AllLand_1981_2010.csv')
+
+#First a list of download URLs : 
+## low input level, co2 fertilization, rainfed (water supply)
+list_dl_si_gaez_Li_co2_rfed = list_files_si_all_land_1981_2010_gaez %>%
+  clean_names() %>%
+  mutate(crop = tolower(crop)) %>%
+  filter(crop %in% list_crop_main) %>%
+  filter(input_level == "Low" 
+         & co2_fertilization == "With CO2 Fertilization"
+         & water_supply == "Rainfed")
+
+## low input level, co2 fertilization, rainfed (water supply)
+list_dl_si_gaez_Li_co2_rfed_all = list_files_si_all_land_1981_2010_gaez %>%
+  clean_names() %>%
+  mutate(crop = tolower(crop)) %>%
+  filter(crop %in% list_crop_main) %>%
+  filter(input_level == "Low" 
+         & co2_fertilization == "With CO2 Fertilization"
+         & water_supply == "Rainfed All Phases")
+
+#Create a list to know which crop corresponds to the file name
+df_name2crop = list_dl_si_gaez_Li_co2_rfed %>%
+  select(c(name, crop))
+
+
+```
+
+### Get data and stack rasters in layers
+
+```{r, eval = F}
+#Rainfed data
+## Define saving directory
+dl_dir_rfed = "gaez/si_gaez_Li_co2_rfed"
+
+for (i in 1:nrow(list_dl_si_gaez_Li_co2_rfed))
+{
+  url = list_dl_si_gaez_Li_co2_rfed[i, download_url]
+  #name_lyr = list_dl_si_gaez_Li_co2_rfed[i, name]
+  name_file = paste0(list_dl_si_gaez_Li_co2_rfed[i, name], ".tif")
+  data = download.file(url,
+                      destfile = paste(dl_dir_rfed, name_file, sep = "/"),
+                      mode = "wb")
+}
+
+
+
+#Rainfed all phases data
+## Define saving directory
+dl_dir_rfed_all = "gaez/si_gaez_Li_co2_rfed_all"
+
+for (i in 1:nrow(list_dl_si_gaez_Li_co2_rfed_all))
+{
+  url = list_dl_si_gaez_Li_co2_rfed_all[i, download_url]
+  #name_lyr = list_dl_si_gaez_Li_co2_rfed[i, name]
+  name_file = paste0(list_dl_si_gaez_Li_co2_rfed_all[i, name], ".tif")
+  data = download.file(url,
+                      destfile = paste(dl_dir_rfed_all, name_file, sep = "/"),
+                      mode = "wb")
+  
+}
+```
+
+### Build rasters
+
+```{r}
+#Create a list of the files downloaded
+list_rast_rfed = list.files("gaez/si_gaez_Li_co2_rfed", 
+                            full.names = TRUE)
+list_rast_rfed_all = list.files("gaez/si_gaez_Li_co2_rfed", 
+                            full.names = TRUE)
+
+#Create a raster where each layers (one crop = one layer) are stacked
+##Globally
+rast_si_rfed = rast(list_rast_rfed)
+rast_si_rfed_all = rast(list_rast_rfed_all)
+##Crop to the extent of the lands we consider (less computations)
+rast_si_rfed_muller = crop(rast_si_rfed, ext_muller)
+rast_si_rfed_all_muller = crop(rast_si_rfed_all, ext_muller)
+```
+
+## Compute the price index
+
+### Relative cell suitability
+
+```{r}
+#Sum of crop suitability for each raster cell
+rast_tot_rfed_muller = app(rast_si_rfed_muller, fun = sum, na.rm = TRUE) %>%
+  rename("si_tot" = "sum") %>%
+  subst(from = 0, to = NA) #0 values (null or NA suitability for all crops) -> NA to avoid errors
+
+# Compute for each cell the relative suitability index (suitability index of a given crop in a given cell, divided by the total crop suitability in a given cell.)
+rast_rsi_rfed_muller = c(rast_si_rfed_muller, rast_tot_rfed_muller) %>%
+  transmute(across(names(rast_si_rfed_muller), ~ .x/si_tot))
+
+#Test on smaller raster to check computation steps
+# ext = extent(134.4, 134.6,-15.6, -15.4) #extent(112, 159,-54, -9)
+# test_si = crop(rast_si_rfed, ext)
+# test_tot = app(test_si, fun = sum, na.rm = TRUE) %>%
+#   rename("si_tot" = "sum") %>%
+#   subst(from = 0, to = NA)
+# test_rsi = c(test_si, test_tot) %>%
+#   transmute(across(names(rast_si_rfed), ~ .x/si_tot))
+
+#plot(rast_rsi_rfed_muller$sxLr_whe)
+```
+
+### Extract relative suitability for each land in our sample
+
+From the relative suitability computed for each crop in each raster
+cell, it is possible to compute average crop suitability in the land
+polygons.
+
+```{r}
+#For each land polygon, extract relative suitability values and average it on polygon area
+df_rsi_muller = extract(x = rast_rsi_rfed_muller, 
+                        y = lmd_T_muller,
+                        raw = TRUE, 
+                        exact = TRUE) %>%
+  as.data.frame() %>%
+  group_by(ID) %>%
+  #Weighted mean of crop suitability among pixels in each land polygon
+  summarise(across(.cols = starts_with("sxLr"),
+                   .fns = ~ weighted.mean(x = .x, w = fraction, na.rm = TRUE),
+                   .names = NULL)) %>%
+  #Pivot to longer : 1 row = land+crop
+  pivot_longer(cols = starts_with("sxLr"), 
+             names_to = "name", 
+             values_to = "rsi") %>%
+  #Change to clearer crop names
+  left_join(df_name2crop, by = c("name")) %>%
+  #Add information on land deals
+  left_join(lmd_T_muller, by = "ID") %>%
+  left_join(lmd_muller, by = c("deal_id", "loc_id")) %>%
+  #Select relevant variables
+  select(c(region:country, deal_id, loc_id, ID, year_int:year_aban, crop, rsi, contract_farming:livestock_com, geometry)) 
+
+
+```
+
+### World price (base = 1999)
+
+The deals I consider in the LMD are intended from 2000. This the base
+year chosen for world price is 1999.
+
+```{r}
+#Select prices for the crop of interests
+wb_prices_annual_main = wb_prices_annual_all %>%
+  #Select relevant crops
+  select(c(year, cocoa, coffee_arabica, coffee_robusta,
+           tea_avg_3_auctions, palm_oil, soybeans, barley,
+           maize, sorghum, coconut_oil,
+           starts_with(c("rice", "wheat", "banana", "sugar")),
+           tobacco_us_import_u_v, cotton_a_index)) %>%
+  #Compute average of the nominal prices (as with tea_avg_3_auctions in the raw data) for rice, wheat, coffee and banana
+  dplyr::rowwise() %>%
+  mutate(coffee_avg = mean(c(coffee_robusta, coffee_arabica), na.rm = TRUE),
+         .after = "coffee_robusta") %>%
+  mutate(rice_avg = mean(c(rice_thai_5_percent, 
+                           rice_thai_25_percent, 
+                           rice_thai_a_1,
+                           rice_viet_namese_5_percent),
+                         na.rm = TRUE),
+         .after = "rice_viet_namese_5_percent") %>%
+  mutate(wheat_avg = mean(c(wheat_us_srw, 
+                         wheat_us_hrw),
+                       na.rm = TRUE),
+       .after = "wheat_us_hrw") %>%
+  mutate(banana_avg = mean(c(banana_europe, 
+                             banana_us),
+                           na.rm = TRUE),
+     .after = "banana_us") %>%
+  ungroup() %>%
+  #Add a world price for dryland and wetland rice (assumed to be similar)
+  mutate(dryland_rice = rice_avg,
+         wetland_rice = rice_avg,
+         .after = "rice_avg")
+
+#Compute price index (base = base_yr)
+yr_base = 1999 
+wb_prices_annual_main_base = wb_prices_annual_main %>%
+  #Build the index : value/base_value*100
+  mutate(across(.cols = !c(year),
+                .fns = ~.x/.x[year == yr_base]*100)) %>%
+  #Select only relevant variables (ie keep average for some crops)
+    select(-c("rice_thai_25_percent", "rice_thai_5_percent", 
+              "rice_thai_a_1", "rice_avg",
+            "rice_viet_namese_5_percent", "wheat_us_srw", "wheat_us_hrw",
+            "sugar_eu", "sugar_us", "banana_us", "banana_europe",
+            "coffee_arabica", "coffee_robusta")) %>%
+  #Make longer to ease matching with RSI dataframe
+  pivot_longer(cols = !year,
+               names_to = "crop",
+               values_to = "wld_price") %>%
+  #Keep only year after base_yr
+  filter(year >= yr_base) %>%
+  #Finally change crop name coherently with GAEZ terminology in df_rsi_muller
+  mutate(crop = case_when(crop == "coffee_avg" ~ "coffee",
+                          crop == "tea_avg_3_auctions" ~ "tea",
+                          crop == "coconut_oil" ~ "coconut",
+                          crop == "cotton_a_index" ~ "cotton",
+                          crop == "palm_oil" ~ "oil palm",
+                          crop == "dryland_rice" ~ "dryland rice",
+                          crop == "wetland_rice" ~ "wetland rice",
+                          crop == "wheat_avg" ~ "wheat",
+                          crop == "banana_avg" ~ "banana",
+                          crop == "sugar_world" ~ "sugarcane",
+                          crop == "tobacco_us_import_u_v" ~ "tobacco",
+                          crop == "soybeans" ~ "soybean",
+                          TRUE ~ crop)) 
+
+```
+
+### Compute world price index for each land
+
+Finally knowing world prices for the crops of interest on the period
+1999-2022, and relative crop suitability in each land polygon, we can
+compute the price index for each land in our sample.
+
+```{r}
+#Finally we compute price index for each year in each land
+df_price_muller = df_rsi_muller %>%
+  #Add the world price of each crop in each year, for each land
+  left_join(wb_prices_annual_main_base, by = "crop") %>%
+  #For each land and year, compute price index (sum of prices weighted by relative crop suitability)
+  group_by(deal_id, loc_id, year) %>%
+  summarize(price_idx_loc = sum(rsi*wld_price, na.rm = TRUE)) %>%
+  ungroup() %>%
+  #Then compute the average price index at deal level 
+  group_by(deal_id, year) %>%
+  summarize(price_idx_deal = mean(price_idx_loc, na.rm = TRUE)) %>%
+  ungroup() %>%
+  #Remove the 9 lands with price_index = 0 on the full period (necessarily only rsi = NA)
+  filter(price_idx_deal != 0) %>%
+  #Add the year of intention, contract and implementation for each land deal
+  left_join(select(lmd_muller, 
+                   c(deal_id, region, sub_region, country, year_int, year_cont, year_impl)), 
+            by = "deal_id") %>%
+  #Add a dummy : 1 if the deal is intended/contracted/implemented the year considered
+  mutate(dummy_int = ifelse(year == year_int, 1, 0),
+         dummy_cont = ifelse(year == year_cont, 1, 0),
+         dummy_impl = ifelse(year == year_impl, 1, 0)) %>%
+  #Reorder variables
+  select(c(region,country, sub_region, deal_id,year, price_idx_deal, year_int:dummy_impl))
+
+
+```
+
+## Analysis
+
+### Visual evidences
+
+#### Define plot datasets : subregional and world level
+
+```{r}
+df_plot_subreg = df_price_muller %>%
+  group_by(sub_region, year) %>%
+  #Count the number of deal intended/contracted/implemented in each sub-region, each year
+  # Compute the average price index across deals for each sub-region/year
+  summarize(n_int = sum(dummy_int, na.rm = TRUE),
+            n_cont = sum(dummy_cont, na.rm = TRUE),
+            n_impl = sum(dummy_impl, na.rm = TRUE),
+            idx_avg = mean(price_idx_deal, na.rm = TRUE)) %>%
+  ungroup()
+  
+# Same at world level
+df_plot_wld = df_price_muller %>%
+  group_by(year) %>%
+    summarize(n_int = sum(dummy_int, na.rm = TRUE),
+            n_cont = sum(dummy_cont, na.rm = TRUE),
+            n_impl = sum(dummy_impl, na.rm = TRUE),
+            idx_avg = mean(price_idx_deal, na.rm = TRUE)) %>%
+  ungroup() 
+```
+
+#### Plot figures : time evolution of land deals, world prices and price index index.
+
+Evolution of world prices, for a subset of crops. Overall, the world
+price of commodities considered increase from 2000 up to around 2010,
+then decrease and increase again from 2020.
+
+```{r}
+#Define a list of crops to reduce the number of curves to display
+#Note dryland and wetland rice follow same evolution exactly
+lst_crop = c("oil palm", "soybean", "maize", "sorghum", "dryland rice", "wheat", "sugarcane")
+fig_wld_prices = ggplot(data = subset(wb_prices_annual_main_base, crop %in% lst_crop),
+                        aes(x = year, y = wld_price, col = crop)) %>%
+  + geom_point() %>%
+  + geom_line() %>%
+  + scale_color_brewer(name = "Crops", type = "seq", palette = "Dark2") %>%
+  + labs(title = 'Evolution of crop world prices',
+         y = "Price index (base = 1999)",
+       x = 'Year') %>%
+  + theme_minimal()
+fig_wld_prices
+
+ggsave(plot = fig_wld_prices,
+       filename = "figures/fig_wld_prices.jpeg",
+       device = "jpeg",
+       width = 9,
+       height = 6)
+
+```
+
+Evolution of price index in the different sub-regions (average of
+parcels' price indices). The agricultural value of land considered,
+proxied by the index, increase from 2000 to around 2008. After a fall in
+2009 it increases again with a peak around 2010. The price index then
+decreases and increase again from 2019. Interestingly the evolution is
+comparable across sub-regions.
+
+```{r}
+fig_idx_subreg = ggplot(df_plot_subreg,
+                 aes(x = year, y = idx_avg, col = sub_region)) %>%
+  + geom_point() %>%
+  + geom_line() %>%
+  + scale_color_manual(name = "Sub-regions",
+                       values = brewer.pal(n = 6, name = "Dark2")) %>%
+  + labs(title = 'Evolution of price index in the different sub-regions',
+         y = "Price index (base = 1999)",
+       x = 'Year') %>%
+  + theme_minimal()
+fig_idx_subreg
+
+ggsave(plot = fig_idx_subreg,
+       filename = "figures/fig_idx_subreg.jpeg",
+       device = "jpeg",
+       width = 9,
+       height = 6)
+```
+
+Tvolution of land deals and price index in the world. Up to 2015, it
+seems that the evolution in the number of deals contracted or intended
+is correlated with the price index (less clear for implementation) : an
+increase up to 2010 then a decrease. The correlation after 2015 is less
+clear. Especially the rise of the price index from 2019 is not followed
+by a rise in land deals. This can be due to the moratoria on land deals
+after 2010 in different countries (e.g Indonesia, see Land Matrix
+Initiative 2021 analytical report).
+
+```{r}
+
+coef = .2
+fig_lsla_idx_wld = ggplot(df_plot_wld,
+                 aes(x = year)) %>%
+  + geom_point(aes(y = n_int, color = "Intended")) %>%
+  + geom_line(aes(y = n_int, color = "Intended")) %>%
+  + geom_point(aes(y = n_cont, color = "Contracted")) %>%
+  + geom_line(aes(y = n_cont, color = "Contracted")) %>%
+  + geom_point(aes(y = n_impl, color = "Implemented")) %>%
+  + geom_line(aes(y = n_impl, color = "Implemented")) %>%
+  + geom_point(aes(y = coef*idx_avg, color = "Index")) %>%
+  + geom_line(aes(y = coef*idx_avg, color = "Index")) %>%
+
+  + scale_y_continuous(name = 'Amount', sec.axis = sec_axis(trans = ~./coef, name = 'Price index (base year = 1999)')) %>%
+  + scale_color_manual(name = "",
+                       values = c("Intended" = "grey80",
+                                  "Contracted" = "grey50",
+                                  "Implemented" = "grey20",
+                                  "Index" = "gold")) %>%
+  + labs(title = 'Co-evolution of price index and land deals over time',
+         subtitle = "World",
+       x = 'Year') %>%
+  + theme_minimal()
+fig_lsla_idx_wld
+
+ggsave(plot = fig_lsla_idx_wld,
+       filename = "figures/fig_lsla_idx_wld.jpeg",
+       device = "jpeg",
+       width = 9,
+       height = 6)
+```
+
+Same graph in the different sub-regions. Due to the low number of deals
+reported, comparison is not relevant in Melanesia and Southern Europe.
+In Eastern Europe, the number of deals intended/contracted/implemented
+does not seem to follow the price index. This relationship is more clear
+in South-eastern Asia and SSA, though some lag can be observed between
+the peak in price index and in the number of deals. In both sub-regions,
+we observe a fall in the number of deals with the drop in price index.
+However the increase in the price index from 2019 is not followed by an
+increase in land deals, as highlighted at world level. Finally, the
+figure for Latin America is less clear to interpret. We observe a major
+peak in 2008 for land deals, while the main price peak is in 2011.
+
+```{r}
+
+#Define a function to plot co-evolution of land deals and price index in the different sub-regions, in a same graph. 
+fn_fig_lsla_idx_subreg = function(df_subreg, coef)
+  {
+  list_fig_subreg = list()
+  list_sub_region = unique(df_subreg$sub_region)
+  coef = coef
+  
+  for(i in 1:length(list_sub_region))
+  { 
+  roi = list_sub_region[i]
+  df = filter(df_subreg, sub_region == roi)
+  fig_i = ggplot(data = df,
+                 aes(x = year)) %>%
+  + geom_point(aes(y = n_int, color = "Intended")) %>%
+  + geom_line(aes(y = n_int, color = "Intended")) %>%
+  + geom_point(aes(y = n_cont, color = "Contracted")) %>%
+  + geom_line(aes(y = n_cont, color = "Contracted")) %>%
+  + geom_point(aes(y = n_impl, color = "Implemented")) %>%
+  + geom_line(aes(y = n_impl, color = "Implemented")) %>%
+  + geom_point(aes(y = coef*idx_avg, color = "Index")) %>%
+  + geom_line(aes(y = coef*idx_avg, color = "Index")) %>%
+
+  + scale_y_continuous(name = 'Amount of reported steps', sec.axis = sec_axis(trans = ~./coef, name = 'Price index (base year = 1999)')) %>%
+  + scale_color_manual(name = "",
+                       values = c("Intended" = "grey80",
+                                  "Contracted" = "grey50",
+                                  "Implemented" = "grey20",
+                                  "Index" = "gold")) %>%
+  + labs(subtitle = paste0(roi, "\n", sum(df$n_int), " intended, ", sum(df$n_cont), " contracted, ", sum(df$n_impl), " implemented")) %>%
+  + theme_minimal()
+  
+    list_fig_subreg[[i]] = fig_i
+    
+  }
+  
+  mplot = plot_grid(plotlist = list_fig_subreg,
+                        align = "hv",
+                        nrow = 3,
+                        ncol = 2,
+                        labels = "AUTO"
+                        )
+
+#Adding a common x and y axis
+
+y.grob <- textGrob("Number of steps reported",
+                 gp=gpar(fontface = "bold", fontsize=15), rot=90)
+x.grob <- textGrob("Year after treatment",
+                 gp=gpar(fontface = "bold", fontsize=15))
+title.grob <- textGrob("Co-evolution of price index and land deals",
+                 gp=gpar(fontface = "bold", fontsize=17))
+# #Building the final figure
+fig = grid.arrange(arrangeGrob(mplot, left = y.grob, bottom = x.grob, top = title.grob))
+
+ggsave(plot = fig,
+       filename = "figures/fig_lsla_idx_subreg.jpeg",
+       device = "jpeg",
+       width = 18,
+       height = 12)
+
+return(fig)
+  
+}
+
+#Call the function and display the graph
+fig_lsla_idx_subreg = fn_fig_lsla_idx_subreg(df_subreg = df_plot_subreg, coef = .1)
+fig_lsla_idx_subreg
+```
