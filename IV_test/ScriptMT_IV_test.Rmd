@@ -103,7 +103,9 @@ lmd_muller = fread("data_muller_092023.csv") %>%
 ## Note land polygons are defined as disk centered on deal location, whose area equals deals reported area in the LMD. This is necessary as most deals have no polygon reported (Müller et al. 2021).
 lmd_T_muller = st_read("Tbuf_muller_092023.geojson") %>%
   filter(loc_id %in% lmd_muller$loc_id) %>%
-  mutate(ID = row_number()) 
+  mutate(ID = row_number(),
+         area_T_km2 = area_T/1e6,
+         area_crop_T_km2 = area_crop_T/1e6) 
 
 ##An extent of land deals to restrict the computation areas of global rasters
 ext_muller = ext(lmd_T_muller)
@@ -229,13 +231,16 @@ rast_rsi_rfed_muller = c(rast_si_rfed_muller, rast_tot_rfed_muller) %>%
 
 ### Extract relative suitability for each land in our sample
 
-From the relative suitability computed for each crop in each raster
-cell, it is possible to compute average crop suitability in the land
-polygons.
+Two possibilities here. From the relative suitability computed for each
+crop in each raster cell, it is possible to (1) compute average crop
+suitability in the land polygons; (2) assign each pixel to a polygon,
+and perform analysis at pixel level.
+
+#### (1) Polygon as unit of analysis
 
 ```{r}
 #For each land polygon, extract relative suitability values and average it on polygon area
-df_rsi_muller = extract(x = rast_rsi_rfed_muller, 
+df_rsi_muller_opt1 = extract(x = rast_rsi_rfed_muller, 
                         y = lmd_T_muller,
                         raw = TRUE, 
                         exact = TRUE) %>%
@@ -258,6 +263,93 @@ df_rsi_muller = extract(x = rast_rsi_rfed_muller,
   select(c(region:country, deal_id, loc_id, ID, year_int:year_aban, crop, rsi, contract_farming:livestock_com, geometry)) 
 
 
+```
+
+#### (2) Pixel as unit of analysis
+
+First let's evaluate the feasibility of this approach.
+
+```{r}
+#The resolution of pixels is 0.0833 degrees, or about 9x9km^2 (depending on latitude)
+res_rast_opt2 = res(rast_rsi_rfed_muller)
+
+#Area of pixels
+## Out of 425 polygons, 61 have an area above 100 km2. It means that most polygons have area below pixel size, so transform the layer of polygons in pixels would lead to extrapolate the grabbed land to the whole pixel.
+tbl_T_muller = lmd_T_muller %>%
+  summarize(min = min(as.numeric(st_area(geometry)/1e6)),
+            max = max(as.numeric(st_area(geometry)/1e6)),
+            mean = mean(as.numeric(st_area(geometry)/1e6)),
+            med = median(as.numeric(st_area(geometry)/1e6)),
+            n_100 = sum(as.numeric(st_area(geometry)/1e6) >= 100),
+            n_1 = sum(as.numeric(st_area(geometry)/1e6) >= 1)) %>%
+  st_drop_geometry()
+
+
+```
+
+Then we can transform polygon layer into pixels.
+
+```{r, eval = F}
+
+#Initialize an empty raster to tranform the layer of polygons
+rast_ini = rast(crs = crs(rast_rsi_rfed_muller),
+                resolution = res(rast_rsi_rfed_muller),
+                extent = ext(rast_rsi_rfed_muller))
+#Create a raster from land polygons
+## Each cell is attributed a polygon ID
+### Two options : a cell is assigned a polygon ID if its center is covered (touches = F) or if the polygon is inside the cell (touches = T, less restrictive). I choose to set touches = F  
+rast_T_muller = rasterize(x = lmd_T_muller,
+                          y = rast_ini,
+                          field = "loc_id",
+                          fun = "min",
+                          background = NA,
+                          cover = F,
+                          update = F,
+                          touches = F)
+
+plot(crop(rast_T_muller, ext(filter(lmd_T_muller, deal_id == 1334))))
+test = rast_T_muller %>% as.data.frame(cells = T, na.rm = T)
+##Get the cover of each cell
+##Eventually, we can then filter cells not enough covered by polygons
+rast_T_muller_cover = rasterize(x = lmd_T_muller,
+                          y = rast_ini,
+                          field = "loc_id",
+                          background = NA,
+                          cover = T,
+                          update = F,
+                          touches = F)
+df_T_muller_cover = rast_T_muller_cover %>% 
+  as.data.frame(cells = T, na.rm = T)
+test = df_T_muller_cover %>% filter(cell %in% c(1512024, 1514913))
+#Bind RSI and polygon raster
+rast_T_rsi_rfed_muller = c(rast_T_muller, rast_rsi_rfed_muller, rast_T_muller_cover)
+
+#Transform it into a dataset
+df_rsi_muller_opt2 = rast_T_rsi_rfed_muller %>%
+  #Keep pixel ID of initial raster, and keep NA values (background or RSI)
+  as.data.frame(cells = T, xy = F, na.rm = F) %>%
+  #Keep only cells within a polygon
+  filter(is.na(loc_id) == F) %>%
+  #Filter pixels not enough covered by a polygon (less than 25%)
+  #filter(layer >= 0.25) %>%
+  #Pivot to longer : 1 row = land+crop
+  pivot_longer(cols = starts_with("sxLr"), 
+             names_to = "name", 
+             values_to = "rsi") %>%
+  #Change to clearer crop names
+  left_join(df_name2crop, by = c("name")) %>%
+  #Add information on land deals
+  left_join(lmd_T_muller, by = "loc_id") %>%
+  select(-c(deal_id)) %>%
+  left_join(lmd_muller, by = "loc_id") %>%
+  #Select relevant variables
+  select(c(region:country, deal_id, loc_id, cell, layer, year_int:year_aban, crop, rsi, contract_farming:livestock_com, geometry)) 
+
+#We observe we have 367 pixels corresponding to 200 polygons (characterized by loc_id) left, so less observations than with polygon level analysis.
+list_poly_opt2 = unique(df_rsi_muller_opt2$loc_id)
+lmd_T_muller_opt2 = lmd_T_muller %>% filter(loc_id %in% list_poly_opt2)
+lmd_T_muller_no_opt2 = lmd_T_muller %>% filter(!(loc_id %in% list_poly_opt2))
+lmd_muller_opt2 = lmd_muller %>% filter(loc_id %in% list_poly_opt2)
 ```
 
 ### World price (base = 1999)
@@ -337,11 +429,14 @@ wb_prices_annual_main_base = wb_prices_annual_main %>%
 
 Finally knowing world prices for the crops of interest on the period
 1999-2022, and relative crop suitability in each land polygon, we can
-compute the price index for each land in our sample.
+compute the price index for each land in our sample. Agin two options
+are possible : (1) work at polygon level; (2) work at pixel level.
+
+#### (1) Polygon level
 
 ```{r}
 #Finally we compute price index for each year in each land
-df_price_muller = df_rsi_muller %>%
+df_price_muller_opt1 = df_rsi_muller_opt1 %>%
   #Add the world price of each crop in each year, for each land
   left_join(wb_prices_annual_main_base, by = "crop") %>%
   #For each land and year, compute price index (sum of prices weighted by relative crop suitability)
@@ -363,7 +458,34 @@ df_price_muller = df_rsi_muller %>%
          dummy_cont = ifelse(year == year_cont, 1, 0),
          dummy_impl = ifelse(year == year_impl, 1, 0)) %>%
   #Reorder variables
-  select(c(region,country, sub_region, deal_id,year, price_idx_deal, year_int:dummy_impl))
+  select(c(region,country, sub_region, deal_id, year, price_idx_deal, year_int:dummy_impl))
+
+
+```
+
+#### (2) Pixel level
+
+```{r, eval = F}
+#Finally we compute price index for each year in each pixel
+df_price_muller_opt2 = df_rsi_muller_opt2 %>%
+  #Add the world price of each crop in each year, for each pixel
+  left_join(wb_prices_annual_main_base, by = "crop") %>%
+  #For each pixel and year, compute price index (sum of prices weighted by relative crop suitability)
+  group_by(deal_id, loc_id, cell, year) %>%
+  summarize(price_idx_pix = sum(rsi*wld_price, na.rm = TRUE)) %>%
+  ungroup() %>%
+  #Remove the 22 cells with price_index = 0 on the full period (necessarily only rsi = NA)
+  filter(price_idx_pix != 0) %>%
+  #Add the year of intention, contract and implementation for each land deal
+  left_join(select(lmd_muller, 
+                   c( loc_id, region, sub_region, country, year_int, year_cont, year_impl)), 
+            by = "loc_id") %>%
+  #Add a dummy : 1 if the deal is intended/contracted/implemented the year considered
+  mutate(dummy_int = ifelse(year == year_int, 1, 0),
+         dummy_cont = ifelse(year == year_cont, 1, 0),
+         dummy_impl = ifelse(year == year_impl, 1, 0)) %>%
+  #Reorder variables
+  select(c(region, country, sub_region, deal_id, loc_id, cell, year, price_idx_pix, year_int:dummy_impl))
 
 
 ```
@@ -375,7 +497,7 @@ df_price_muller = df_rsi_muller %>%
 #### Define plot datasets : subregional and world level
 
 ```{r}
-df_plot_subreg = df_price_muller %>%
+df_plot_subreg_opt1 = df_price_muller_opt1 %>%
   group_by(sub_region, year) %>%
   #Count the number of deal intended/contracted/implemented in each sub-region, each year
   # Compute the average price index across deals for each sub-region/year
@@ -386,7 +508,7 @@ df_plot_subreg = df_price_muller %>%
   ungroup()
   
 # Same at world level
-df_plot_wld = df_price_muller %>%
+df_plot_wld_opt1 = df_price_muller_opt1 %>%
   group_by(year) %>%
     summarize(n_int = sum(dummy_int, na.rm = TRUE),
             n_cont = sum(dummy_cont, na.rm = TRUE),
@@ -432,26 +554,27 @@ decreases and increase again from 2019. Interestingly the evolution is
 comparable across sub-regions.
 
 ```{r}
-fig_idx_subreg = ggplot(df_plot_subreg,
+fig_idx_subreg_opt1 = ggplot(df_plot_subreg_opt1,
                  aes(x = year, y = idx_avg, col = sub_region)) %>%
   + geom_point() %>%
   + geom_line() %>%
   + scale_color_manual(name = "Sub-regions",
                        values = brewer.pal(n = 6, name = "Dark2")) %>%
   + labs(title = 'Evolution of price index in the different sub-regions',
+         subtitle = "Analysis at polygon level",
          y = "Price index (base = 1999)",
        x = 'Year') %>%
   + theme_minimal()
-fig_idx_subreg
+fig_idx_subreg_opt1
 
-ggsave(plot = fig_idx_subreg,
-       filename = "figures/fig_idx_subreg.jpeg",
+ggsave(plot = fig_idx_subreg_opt1,
+       filename = "figures/fig_idx_subreg_poly.jpeg",
        device = "jpeg",
        width = 9,
        height = 6)
 ```
 
-Tvolution of land deals and price index in the world. Up to 2015, it
+Evolution of land deals and price index in the world. Up to 2015, it
 seems that the evolution in the number of deals contracted or intended
 is correlated with the price index (less clear for implementation) : an
 increase up to 2010 then a decrease. The correlation after 2015 is less
@@ -463,7 +586,7 @@ Initiative 2021 analytical report).
 ```{r}
 
 coef = .2
-fig_lsla_idx_wld = ggplot(df_plot_wld,
+fig_lsla_idx_wld_opt1 = ggplot(df_plot_wld_opt1,
                  aes(x = year)) %>%
   + geom_point(aes(y = n_int, color = "Intended")) %>%
   + geom_line(aes(y = n_int, color = "Intended")) %>%
@@ -481,13 +604,13 @@ fig_lsla_idx_wld = ggplot(df_plot_wld,
                                   "Implemented" = "grey20",
                                   "Index" = "gold")) %>%
   + labs(title = 'Co-evolution of price index and land deals over time',
-         subtitle = "World",
+         subtitle = "World, analysis at polygon level",
        x = 'Year') %>%
   + theme_minimal()
-fig_lsla_idx_wld
+fig_lsla_idx_wld_opt1
 
-ggsave(plot = fig_lsla_idx_wld,
-       filename = "figures/fig_lsla_idx_wld.jpeg",
+ggsave(plot = fig_lsla_idx_wld_opt1,
+       filename = "figures/fig_lsla_idx_wld_poly.jpeg",
        device = "jpeg",
        width = 9,
        height = 6)
@@ -508,7 +631,7 @@ peak in 2008 for land deals, while the main price peak is in 2011.
 ```{r}
 
 #Define a function to plot co-evolution of land deals and price index in the different sub-regions, in a same graph. 
-fn_fig_lsla_idx_subreg = function(df_subreg, coef)
+fn_fig_lsla_idx_subreg_opt1 = function(df_subreg, coef)
   {
   list_fig_subreg = list()
   list_sub_region = unique(df_subreg$sub_region)
@@ -555,13 +678,13 @@ y.grob <- textGrob("Number of steps reported",
                  gp=gpar(fontface = "bold", fontsize=15), rot=90)
 x.grob <- textGrob("Year after treatment",
                  gp=gpar(fontface = "bold", fontsize=15))
-title.grob <- textGrob("Co-evolution of price index and land deals",
+title.grob <- textGrob("Co-evolution of price index and land deals, at polygon level",
                  gp=gpar(fontface = "bold", fontsize=17))
 # #Building the final figure
 fig = grid.arrange(arrangeGrob(mplot, left = y.grob, bottom = x.grob, top = title.grob))
 
 ggsave(plot = fig,
-       filename = "figures/fig_lsla_idx_subreg.jpeg",
+       filename = "figures/fig_lsla_idx_subreg_poly.jpeg",
        device = "jpeg",
        width = 18,
        height = 12)
@@ -571,6 +694,88 @@ return(fig)
 }
 
 #Call the function and display the graph
-fig_lsla_idx_subreg = fn_fig_lsla_idx_subreg(df_subreg = df_plot_subreg, coef = .1)
-fig_lsla_idx_subreg
+fig_lsla_idx_subreg_opt1 = fn_fig_lsla_idx_subreg_opt1(df_subreg = df_plot_subreg_opt1, coef = .1)
+fig_lsla_idx_subreg_opt1
+```
+
+### Testing the IV
+
+Outcome : predicting the fact the deal/pixel is implemented
+
+```{r}
+#A linear model : whether the deal is implemented or not, regressed on price index. Do it for SSA and SEA and World
+
+#A dataframe to estimate the model
+df_est1_wld_poly = df_price_muller_opt1 %>%
+  #remove deals with unknown implementation date, and restrict to before COVID period
+  filter(is.na(year_impl) == F & year <= 2020) %>%
+  #Add a dummy for treatment : 1 once the deal is implemented, 0 before
+  group_by(deal_id) %>%
+  mutate(is_impl = as.numeric(year >= year_impl)) %>%
+  ungroup()
+df_est1_wld_pix = df_price_muller_opt2 %>%
+  #remove deals with unknown implementation date, and restrict to before COVID period
+  filter(is.na(year_impl) == F & year <= 2020) %>%
+  #Add a dummy for treatment : 1 once the deal is implemented, 0 before
+  group_by(cell) %>%
+  mutate(is_impl = as.numeric(year >= year_impl)) %>%
+  ungroup()
+#Estimate the models
+##World
+lm1_wld_opt1 = lfe::felm(formula = is_impl ~ price_idx_deal | deal_id + year | 0 ,
+                        data = df_est1_wld_poly)
+summary(lm1_wld_opt1)
+lm1_wld_opt2 = lfe::felm(formula = is_impl ~ price_idx_pix | cell + year | 0 | deal_id ,
+                        data = df_est1_wld_pix)
+summary(lm1_wld_opt2)
+##SEA
+lm1_sea_opt1 = lfe::felm(formula = dummy_impl ~ price_idx_deal | deal_id + year | 0 ,
+                        data = filter(df_est1_wld_poly, sub_region == "South-eastern Asia"))
+summary(lm1_sea_opt1)
+lm1_sea_opt2 = lfe::felm(formula = is_impl ~ price_idx_pix | cell + year | 0 | deal_id ,
+                        data = filter(df_est1_wld_pix, sub_region == "South-eastern Asia"))
+summary(lm1_sea_opt2)
+##SSA
+lm1_ssa_opt1 = lfe::felm(formula = is_impl ~ price_idx_deal | deal_id + year | 0,
+                        data = filter(df_est1_wld_poly, sub_region == "Sub-Saharan Africa"))
+summary(lm1_ssa_opt1)
+lm1_ssa_opt2 = lfe::felm(formula = is_impl ~ price_idx_pix | cell + year | 0 | deal_id ,
+                        data = filter(df_est1_wld_pix, sub_region == "Sub-Saharan Africa"))
+summary(lm1_ssa_opt2)
+```
+
+Outcome : the number of deal implemented at sub-regional level
+
+```{r}
+#Create dataframe
+df_est2_wld_poly = df_price_muller_opt1 %>%
+   #remove deals with unknown implementation date, and restrict to before COVID period
+  filter(is.na(year_impl) == F & year <= 2020) %>%
+  group_by(sub_region, year) %>%
+  summarize(avg_price_idx = mean(price_idx_deal),
+         n_impl = sum(dummy_impl)) %>%
+  ungroup()
+df_est2_wld_pix = df_price_muller_opt2 %>%
+   #remove deals with unknown implementation date, and restrict to before COVID period
+  filter(is.na(year_impl) == F & year <= 2020) %>%
+  group_by(sub_region, year) %>%
+  summarize(avg_price_idx = mean(price_idx_pix),
+         n_impl = sum(dummy_impl)) %>%
+  ungroup()
+
+#Estimate linear models
+##SEA 
+lm2_sea_opt1 = felm(formula = n_impl ~ avg_price_idx | sub_region | 0 | 0 ,
+                        data = filter(df_est2_wld_poly, sub_region == "South-eastern Asia"))
+summary(lm2_sea_opt1)
+lm2_sea_opt2 = felm(formula = n_impl ~ avg_price_idx | sub_region | 0 | 0 ,
+                        data = filter(df_est2_wld_pix, sub_region == "South-eastern Asia"))
+summary(lm2_sea_opt2)
+##SSA
+lm2_ssa_opt1 = felm(formula = n_impl ~ avg_price_idx | sub_region  | 0 | 0 ,
+                        data = filter(df_est2_wld_poly, sub_region == "Sub-Saharan Africa"))
+summary(lm2_ssa_opt1)
+lm2_ssa_opt2 = felm(formula = n_impl ~ avg_price_idx | sub_region  | 0 | 0 ,
+                        data = filter(df_est2_wld_pix, sub_region == "Sub-Saharan Africa"))
+summary(lm2_ssa_opt2)
 ```
