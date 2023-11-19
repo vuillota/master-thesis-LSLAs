@@ -703,7 +703,7 @@ fig_lsla_idx_subreg_opt1
 Outcome : predicting the fact the deal/pixel is implemented
 
 ```{r}
-#A linear model : whether the deal is implemented or not, regressed on price index. Do it for SSA and SEA and World
+#A linear model : whether the deal has been implemented or not, regressed on price index. Do it for SSA and SEA and World
 
 #A dataframe to estimate the model
 df_est1_wld_poly = df_price_muller_opt1 %>%
@@ -722,23 +722,29 @@ df_est1_wld_pix = df_price_muller_opt2 %>%
   ungroup()
 #Estimate the models
 ##World
+### Polygon level -> sig, +
 lm1_wld_opt1 = lfe::felm(formula = is_impl ~ price_idx_deal | deal_id + year | 0 ,
                         data = df_est1_wld_poly)
 summary(lm1_wld_opt1)
+### Pixel level -> sig, +
 lm1_wld_opt2 = lfe::felm(formula = is_impl ~ price_idx_pix | cell + year | 0 | deal_id ,
                         data = df_est1_wld_pix)
 summary(lm1_wld_opt2)
 ##SEA
-lm1_sea_opt1 = lfe::felm(formula = dummy_impl ~ price_idx_deal | deal_id + year | 0 ,
+### Polygon -> non sig
+lm1_sea_opt1 = lfe::felm(formula = is_impl ~ price_idx_deal | deal_id + year | 0 ,
                         data = filter(df_est1_wld_poly, sub_region == "South-eastern Asia"))
 summary(lm1_sea_opt1)
+### Pixel -> non sig
 lm1_sea_opt2 = lfe::felm(formula = is_impl ~ price_idx_pix | cell + year | 0 | deal_id ,
                         data = filter(df_est1_wld_pix, sub_region == "South-eastern Asia"))
 summary(lm1_sea_opt2)
 ##SSA
+### Polygon -> sig, +
 lm1_ssa_opt1 = lfe::felm(formula = is_impl ~ price_idx_deal | deal_id + year | 0,
                         data = filter(df_est1_wld_poly, sub_region == "Sub-Saharan Africa"))
 summary(lm1_ssa_opt1)
+### Pixel -> sig, +
 lm1_ssa_opt2 = lfe::felm(formula = is_impl ~ price_idx_pix | cell + year | 0 | deal_id ,
                         data = filter(df_est1_wld_pix, sub_region == "Sub-Saharan Africa"))
 summary(lm1_ssa_opt2)
@@ -765,6 +771,9 @@ df_est2_wld_pix = df_price_muller_opt2 %>%
 
 #Estimate linear models
 ##SEA 
+n_sea_poly = length(unique(filter(df_est1_wld_poly, sub_region == "South-eastern Asia")$deal_id))
+n_sea_pix = length(unique(filter(df_est1_wld_pix, sub_region == "South-eastern Asia")$cell))
+### Poly --> sig, +
 lm2_sea_opt1 = felm(formula = n_impl ~ avg_price_idx | sub_region | 0 | 0 ,
                         data = filter(df_est2_wld_poly, sub_region == "South-eastern Asia"))
 summary(lm2_sea_opt1)
@@ -772,9 +781,13 @@ lm2_sea_opt2 = felm(formula = n_impl ~ avg_price_idx | sub_region | 0 | 0 ,
                         data = filter(df_est2_wld_pix, sub_region == "South-eastern Asia"))
 summary(lm2_sea_opt2)
 ##SSA
+n_ssa_poly = length(unique(filter(df_est1_wld_poly, sub_region == "Sub-Saharan Africa")$deal_id))
+n_ssa_pix = length(unique(filter(df_est1_wld_pix, sub_region == "Sub-Saharan Africa")$cell))
+### Poly --> sig, +
 lm2_ssa_opt1 = felm(formula = n_impl ~ avg_price_idx | sub_region  | 0 | 0 ,
                         data = filter(df_est2_wld_poly, sub_region == "Sub-Saharan Africa"))
 summary(lm2_ssa_opt1)
+### Pixel --> non-sig
 lm2_ssa_opt2 = felm(formula = n_impl ~ avg_price_idx | sub_region  | 0 | 0 ,
                         data = filter(df_est2_wld_pix, sub_region == "Sub-Saharan Africa"))
 summary(lm2_ssa_opt2)
